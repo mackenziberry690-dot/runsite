@@ -1,5 +1,5 @@
 const http = require("node:http");
-const { Readable } = require("node:stream");
+const https = require("node:https");
 
 const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 const PUBLIC_RELAY_PATH = normalizeRelayPath(process.env.PUBLIC_RELAY_PATH || "/api");
@@ -100,9 +100,6 @@ const server = http.createServer(async (req, res) => {
   }
   inFlight++;
 
-  const abortCtrl = new AbortController();
-  let timeoutRef;
-
   try {
     const upstreamPath = mapPublicPathToRelayPath(
       normalizedPath,
@@ -112,41 +109,7 @@ const server = http.createServer(async (req, res) => {
     const targetUrl = `${TARGET_BASE}${upstreamPath}${url.search || ""}`;
     const forwardHeaders = buildForwardHeaders(req);
 
-    if (UPSTREAM_TIMEOUT_MS > 0) {
-      timeoutRef = setTimeout(() => abortCtrl.abort(), UPSTREAM_TIMEOUT_MS);
-    }
-
-    const hasBody = req.method !== "GET" && req.method !== "HEAD";
-    const fetchOpts = {
-      method: req.method,
-      headers: forwardHeaders,
-      redirect: "manual",
-      signal: abortCtrl.signal,
-    };
-
-    if (hasBody) {
-      fetchOpts.body = req;
-      fetchOpts.duplex = "half";
-    }
-
-    const upstream = await fetch(targetUrl, fetchOpts);
-
-    res.statusCode = upstream.status;
-    for (const [key, value] of upstream.headers.entries()) {
-      const lower = key.toLowerCase();
-      if (lower === "transfer-encoding" || lower === "connection") continue;
-      try {
-        res.setHeader(key, value);
-      } catch {
-        // Skip headers rejected by Node's HTTP implementation.
-      }
-    }
-
-    if (!upstream.body) {
-      return res.end();
-    }
-
-    Readable.fromWeb(upstream.body).pipe(res);
+    await proxyToUpstream(req, res, targetUrl, forwardHeaders);
   } catch (err) {
     if (res.headersSent) {
       res.destroy(err instanceof Error ? err : new Error(String(err)));
@@ -157,7 +120,6 @@ const server = http.createServer(async (req, res) => {
     }
     return sendText(res, 502, "Bad Gateway: " + String(err));
   } finally {
-    if (timeoutRef !== undefined) clearTimeout(timeoutRef);
     inFlight = Math.max(0, inFlight - 1);
   }
 });
@@ -202,6 +164,108 @@ function buildForwardHeaders(req) {
   }
 
   return headers;
+}
+
+function proxyToUpstream(req, res, targetUrl, forwardHeaders) {
+  return new Promise((resolve, reject) => {
+    const upstreamUrl = new URL(targetUrl);
+    const transport = upstreamUrl.protocol === "https:" ? https : http;
+    if (upstreamUrl.protocol !== "https:" && upstreamUrl.protocol !== "http:") {
+      reject(new Error(`Unsupported upstream protocol: ${upstreamUrl.protocol}`));
+      return;
+    }
+
+    let timeoutRef;
+    let settled = false;
+    let upstreamReq;
+    let upstreamRes;
+
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutRef !== undefined) clearTimeout(timeoutRef);
+      cleanup();
+      if (err) reject(err);
+      else resolve();
+    };
+
+    const onClientClose = () => {
+      if (!res.writableEnded) {
+        if (upstreamReq) upstreamReq.destroy();
+        if (upstreamRes) upstreamRes.destroy();
+      }
+      finish();
+    };
+
+    const cleanup = () => {
+      req.off("error", finish);
+      res.off("error", finish);
+      res.off("finish", finish);
+      res.off("close", onClientClose);
+      if (upstreamReq) upstreamReq.off("error", finish);
+      if (upstreamRes) {
+        upstreamRes.off("error", finish);
+        upstreamRes.off("end", finish);
+      }
+    };
+
+    const requestOptions = {
+      protocol: upstreamUrl.protocol,
+      hostname: upstreamUrl.hostname,
+      port: upstreamUrl.port || undefined,
+      method: req.method,
+      path: `${upstreamUrl.pathname}${upstreamUrl.search}`,
+      headers: headersToObject(forwardHeaders),
+    };
+
+    upstreamReq = transport.request(requestOptions, (response) => {
+      upstreamRes = response;
+      res.statusCode = response.statusCode || 502;
+
+      for (const [key, value] of Object.entries(response.headers)) {
+        const lower = key.toLowerCase();
+        if (lower === "transfer-encoding" || lower === "connection") continue;
+        if (value === undefined) continue;
+        try {
+          res.setHeader(key, value);
+        } catch {
+          // Skip headers rejected by Node's HTTP implementation.
+        }
+      }
+
+      response.on("error", finish);
+      response.on("end", finish);
+      response.pipe(res);
+    });
+
+    req.on("error", finish);
+    res.on("error", finish);
+    res.on("finish", finish);
+    res.on("close", onClientClose);
+    upstreamReq.on("error", finish);
+
+    if (UPSTREAM_TIMEOUT_MS > 0) {
+      timeoutRef = setTimeout(() => {
+        const err = new Error("Upstream Timeout");
+        err.name = "AbortError";
+        upstreamReq.destroy(err);
+      }, UPSTREAM_TIMEOUT_MS);
+    }
+
+    if (req.method === "GET" || req.method === "HEAD") {
+      upstreamReq.end();
+    } else {
+      req.pipe(upstreamReq);
+    }
+  });
+}
+
+function headersToObject(headers) {
+  const out = {};
+  for (const [key, value] of headers.entries()) {
+    out[key] = value;
+  }
+  return out;
 }
 
 function shouldForwardHeader(name) {
