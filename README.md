@@ -43,6 +43,8 @@ PORT=3000
 
 If you choose a different service port in RunSite, set `PORT` to that same value.
 
+If RunSite auto-detects Docker, this repository also includes a Dockerfile. The Docker build uses `npm ci`, so keep `package-lock.json` in the uploaded archive or Git repository.
+
 After deployment, check:
 
 ```text
